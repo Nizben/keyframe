@@ -1,5 +1,6 @@
 from tqdm import tqdm
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+import time
 import torch
 
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
@@ -42,6 +43,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
         self.local_attn_size = self.generator.model.local_attn_size
+        self.debug_cache_logs = bool(getattr(args, "debug_cache_logs", False))
+        self.enforce_chunk_step_match = bool(getattr(args, "enforce_chunk_step_match", False))
+        self.offload_text_encoder = bool(getattr(args, "offload_text_encoder", True))
 
         print(f"KV inference with {self.num_frame_per_block} frames per block")
 
@@ -55,7 +59,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         initial_latent: Optional[torch.Tensor] = None,
         return_latents: bool = False,
         start_frame_index: Optional[int] = 0,
-        return_video=True
+        return_video=True,
+        steps_per_chunk: Optional[List[int]] = None,
+        return_chunk_logs: bool = False,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -69,6 +75,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 If num_input_frames is greater than 1, perform video extension.
             return_latents (bool): Whether to return the latents.
             start_frame_index (int): In long video generation, where does the current window start?
+            steps_per_chunk (List[int], optional): Optional per-chunk denoising step budget.
+                If None, the global default sampling steps are used for all chunks.
+            return_chunk_logs (bool): Whether to return per-chunk step and timing logs.
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
                 (batch_size, num_frames, num_channels, height, width). It is normalized to be in the range [0, 1].
@@ -85,12 +94,18 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             num_blocks = (num_frames - 1) // self.num_frame_per_block
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
         num_output_frames = num_frames + num_input_frames  # add the initial latent frames
+        # Ensure prompt encoding happens on the same CUDA device as the denoising model.
+        self.text_encoder.to(device=noise.device)
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
         unconditional_dict = self.text_encoder(
             text_prompts=[self.args.negative_prompt] * len(text_prompts)
         )
+        if self.offload_text_encoder:
+            self.text_encoder.to(device=torch.device("cpu"))
+            if noise.device.type == "cuda":
+                torch.cuda.empty_cache()
 
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
@@ -190,13 +205,54 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
-        for current_num_frames in all_num_frames:
+        if steps_per_chunk is None:
+            requested_steps_per_chunk = [self.sampling_steps] * len(all_num_frames)
+        else:
+            if len(steps_per_chunk) != len(all_num_frames):
+                raise ValueError(
+                    f"steps_per_chunk length mismatch: expected {len(all_num_frames)}, "
+                    f"got {len(steps_per_chunk)}"
+                )
+
+            requested_steps_per_chunk = []
+            for chunk_idx, steps in enumerate(steps_per_chunk):
+                if isinstance(steps, bool):
+                    raise TypeError(
+                        f"steps_per_chunk[{chunk_idx}] must be a positive integer, got bool."
+                    )
+                if not isinstance(steps, int):
+                    raise TypeError(
+                        f"steps_per_chunk[{chunk_idx}] must be an integer, got {type(steps).__name__}."
+                    )
+                if steps <= 0:
+                    raise ValueError(
+                        f"steps_per_chunk[{chunk_idx}] must be positive, got {steps}."
+                    )
+                requested_steps_per_chunk.append(steps)
+
+        chunk_logs: List[Dict[str, Any]] = []
+        for chunk_idx, current_num_frames in enumerate(all_num_frames):
+            chunk_start_time = time.perf_counter()
+            requested_steps = requested_steps_per_chunk[chunk_idx]
             noisy_input = noise[
                 :, cache_start_frame - num_input_frames:cache_start_frame + current_num_frames - num_input_frames]
             latents = noisy_input
 
             # Step 3.1: Spatial denoising loop
-            sample_scheduler = self._initialize_sample_scheduler(noise)
+            sample_scheduler = self._initialize_sample_scheduler(
+                noise, sampling_steps=requested_steps
+            )
+            actual_steps = len(sample_scheduler.timesteps)
+            warning = ""
+            if actual_steps != requested_steps:
+                warning = (
+                    "Requested denoising steps do not match scheduler timesteps "
+                    f"(requested={requested_steps}, actual={actual_steps})."
+                )
+                if self.enforce_chunk_step_match:
+                    raise RuntimeError(
+                        f"{warning} chunk_idx={chunk_idx}, num_frames={current_num_frames}"
+                    )
             for _, t in enumerate(tqdm(sample_scheduler.timesteps)):
                 latent_model_input = latents
                 timestep = t * torch.ones(
@@ -231,8 +287,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     latents,
                     return_dict=False)[0]
                 latents = temp_x0
-                print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
-                print(f"kv_cache['global_end_index']: {self.kv_cache_pos[0]['global_end_index']}")
+                if self.debug_cache_logs:
+                    print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
+                    print(f"kv_cache['global_end_index']: {self.kv_cache_pos[0]['global_end_index']}")
 
             # Step 3.2: record the model's output
             output[:, cache_start_frame:cache_start_frame + current_num_frames] = latents
@@ -260,6 +317,14 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
             cache_start_frame += current_num_frames
+            chunk_logs.append({
+                "chunk_idx": chunk_idx,
+                "num_frames": current_num_frames,
+                "requested_num_steps": requested_steps,
+                "actual_num_steps": actual_steps,
+                "runtime_sec": time.perf_counter() - chunk_start_time,
+                "warning": warning,
+            })
 
         # Step 4: Decode the output
         if return_video:
@@ -267,10 +332,16 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             video = (video * 0.5 + 0.5).clamp(0, 1)
 
             if return_latents:
+                if return_chunk_logs:
+                    return video, output, chunk_logs
                 return video, output
             else:
+                if return_chunk_logs:
+                    return video, chunk_logs
                 return video
         else:
+            if return_chunk_logs:
+                return output, chunk_logs
             return output
 
     
@@ -320,8 +391,13 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
         num_output_frames = num_frames + num_input_frames
 
+        self.text_encoder.to(device=noise.device)
         conditional_dict = self.text_encoder(text_prompts=text_prompts)
         unconditional_dict = self.text_encoder(text_prompts=[self.args.negative_prompt] * len(text_prompts))
+        if self.offload_text_encoder:
+            self.text_encoder.to(device=torch.device("cpu"))
+            if noise.device.type == "cuda":
+                torch.cuda.empty_cache()
 
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
@@ -493,12 +569,17 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             
         if conditional_dict is None:
             assert text_prompts is not None
+            self.text_encoder.to(device=noisy_input.device)
             conditional_dict = self.text_encoder(
                 text_prompts=text_prompts
             )
             unconditional_dict = self.text_encoder(
                 text_prompts=[self.args.negative_prompt] * len(text_prompts)
             )
+            if self.offload_text_encoder:
+                self.text_encoder.to(device=torch.device("cpu"))
+                if noisy_input.device.type == "cuda":
+                    torch.cuda.empty_cache()
             
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],

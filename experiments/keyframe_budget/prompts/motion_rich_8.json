@@ -1,0 +1,34 @@
+[
+  {
+    "prompt_id": "motion_001",
+    "prompt_text": "A handheld camera follows a parkour runner leaping across rainy rooftops at dusk with reflections and splashes."
+  },
+  {
+    "prompt_id": "motion_002",
+    "prompt_text": "A drone chases a speedboat weaving through narrow canyons with foam trails and dynamic water spray."
+  },
+  {
+    "prompt_id": "motion_003",
+    "prompt_text": "A snowboarder carves down a steep powder slope while wind throws snow particles across the lens."
+  },
+  {
+    "prompt_id": "motion_004",
+    "prompt_text": "A horse gallops through shallow surf at sunrise with cinematic backlight and crashing waves."
+  },
+  {
+    "prompt_id": "motion_005",
+    "prompt_text": "A cyclist sprints through a neon-lit city intersection with passing traffic and motion blur."
+  },
+  {
+    "prompt_id": "motion_006",
+    "prompt_text": "A fighter jet performs a low-altitude canyon roll with heat haze and fast parallax terrain."
+  },
+  {
+    "prompt_id": "motion_007",
+    "prompt_text": "A robot dog runs through a factory floor dodging moving cranes and sparks from welding arms."
+  },
+  {
+    "prompt_id": "motion_008",
+    "prompt_text": "A basketball player performs a fast break and slam dunk in a crowded arena with camera whip pans."
+  }
+]

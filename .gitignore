@@ -4,5 +4,17 @@ __pycache__
 wan_models
 checkpoints
 output
+outputs
+logs/
 dataset
 prompts/vidprom_filtered_extended.txt
+
+# Keyframe-budget run artifacts (generated videos and rollout caches)
+outputs/**/rollouts/
+outputs/**/*.mp4
+outputs/**/thumbs/
+
+# Keep decision report artifacts trackable
+!outputs/keyframe_budget/
+!outputs/keyframe_budget/decision_report/
+!outputs/keyframe_budget/decision_report/**

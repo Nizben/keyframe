@@ -1,7 +1,7 @@
 import argparse
-import argparse
 import torch
 import os
+import ast
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision import transforms
@@ -30,6 +30,18 @@ parser.add_argument("--num_output_frames", type=int, default=21, help="Number of
 parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA parameters")
 parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (or T2V by default)")
+parser.add_argument(
+    "--steps-per-chunk",
+    type=str,
+    default="",
+    help="Optional comma-separated list of denoising steps per chunk, e.g. '8,8,24,8'.",
+)
+parser.add_argument(
+    "--steps-per-chunk-file",
+    type=str,
+    default="",
+    help="Optional path to a JSON or Python-list file containing steps_per_chunk.",
+)
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -115,6 +127,42 @@ if local_rank == 0:
 if dist.is_initialized():
     dist.barrier()
 
+def _parse_steps_per_chunk_arg(value: str):
+    if not value:
+        return None
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    if not items:
+        return None
+    return [int(item) for item in items]
+
+
+def _parse_steps_per_chunk_file(path: str):
+    if not path:
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read().strip()
+    if not raw:
+        return None
+    try:
+        if raw[0] in ("[", "("):
+            data = ast.literal_eval(raw)
+        else:
+            data = json.loads(raw)
+    except Exception:
+        data = json.loads(raw)
+    if not isinstance(data, (list, tuple)):
+        raise ValueError("steps-per-chunk-file must contain a list/tuple of integers.")
+    return [int(item) for item in data]
+
+
+steps_per_chunk_cli = _parse_steps_per_chunk_arg(args.steps_per_chunk)
+steps_per_chunk_file = _parse_steps_per_chunk_file(args.steps_per_chunk_file)
+if steps_per_chunk_cli is not None and steps_per_chunk_file is not None:
+    raise ValueError("Use only one of --steps-per-chunk or --steps-per-chunk-file.")
+steps_per_chunk = steps_per_chunk_cli if steps_per_chunk_cli is not None else steps_per_chunk_file
+if steps_per_chunk is not None and not isinstance(pipeline, CausalDiffusionInferencePipeline):
+    raise ValueError("steps_per_chunk is only supported with CausalDiffusionInferencePipeline.")
+
 def encode(self, videos: torch.Tensor) -> torch.Tensor:
     device, dtype = videos[0].device, videos[0].dtype
     scale = [self.mean.to(device=device, dtype=dtype),
@@ -176,12 +224,30 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         )
 
     # Generate 81 frames
-    video, latents = pipeline.inference(
-        noise=sampled_noise,
-        text_prompts=prompts,
-        return_latents=True,
-        initial_latent=initial_latent
-    )
+    inference_kwargs = {
+        "noise": sampled_noise,
+        "text_prompts": prompts,
+        "return_latents": True,
+        "initial_latent": initial_latent,
+    }
+    if steps_per_chunk is not None and isinstance(pipeline, CausalDiffusionInferencePipeline):
+        inference_kwargs["steps_per_chunk"] = steps_per_chunk
+        inference_kwargs["return_chunk_logs"] = True
+
+    inference_output = pipeline.inference(**inference_kwargs)
+    if (
+        isinstance(inference_output, tuple)
+        and len(inference_output) == 3
+        and isinstance(pipeline, CausalDiffusionInferencePipeline)
+    ):
+        video, latents, chunk_logs = inference_output
+        if local_rank == 0:
+            requested = [item.get("requested_num_steps", -1) for item in chunk_logs]
+            actual = [item.get("actual_num_steps", -1) for item in chunk_logs]
+            print(f"Per-chunk steps requested: {requested}")
+            print(f"Per-chunk steps actual:    {actual}")
+    else:
+        video, latents = inference_output
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)
     num_generated_frames += latents.shape[1]
