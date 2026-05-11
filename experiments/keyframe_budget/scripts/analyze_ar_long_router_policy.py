@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -30,6 +31,20 @@ ALL_METRICS = (
     "subject_consistency",
     "background_consistency",
 )
+
+
+def stable_seed(*parts: object) -> int:
+    digest = hashlib.sha256("::".join(str(part) for part in parts).encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+def bootstrap_mean_ci(values: pd.Series, n_bootstrap: int = 1000, seed: int = 0) -> Tuple[float, float]:
+    clean = values.dropna().to_numpy(dtype=float)
+    if len(clean) == 0 or n_bootstrap <= 0:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    means = [float(np.mean(clean[rng.integers(0, len(clean), size=len(clean))])) for _ in range(n_bootstrap)]
+    return float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))
 
 
 def write_csv(path: Path, df: pd.DataFrame) -> None:
@@ -96,21 +111,30 @@ def parse_policy(policy_name: str) -> Tuple[str, int, str]:
         family = "Amax_no_chunk0"
     elif policy_name.startswith("Amax"):
         family = "Amax"
-    elif policy_name.startswith("oracle"):
-        family = "oracle"
+    elif policy_name.startswith("single_heavy_oracle") or policy_name.startswith("oracle"):
+        family = "single_heavy_oracle"
     else:
         family = policy_name
     return family, k, policy_name
 
 
 def add_deltas(policy_scores: pd.DataFrame, baseline_records: pd.DataFrame) -> pd.DataFrame:
-    baselines = metric_pivot(
-        baseline_records[baseline_records["schedule"].isin(["all_fast", "all_heavy"])]
-    )
+    same_batch_baselines = policy_scores[policy_scores["policy_name"].isin(["all_fast", "all_heavy"])]
+    if set(same_batch_baselines["policy_name"]) == {"all_fast", "all_heavy"}:
+        baselines = same_batch_baselines
+        baseline_source = "same_batch"
+    else:
+        baselines = metric_pivot(
+            baseline_records[baseline_records["schedule"].isin(["all_fast", "all_heavy"])]
+        )
+        baseline_source = "external"
     fast = baselines[baselines["policy_name"] == "all_fast"].drop(columns=["policy_name"])
     heavy = baselines[baselines["policy_name"] == "all_heavy"].drop(columns=["policy_name"])
+    if fast.empty or heavy.empty:
+        raise RuntimeError("Need all_fast and all_heavy baselines, either in router VBench or baseline VBench.")
     merged = policy_scores.merge(fast, on=["prompt_id", "seed"], suffixes=("", "_all_fast"))
     merged = merged.merge(heavy, on=["prompt_id", "seed"], suffixes=("", "_all_heavy"))
+    merged["baseline_source"] = baseline_source
 
     for metric in ALL_METRICS:
         if metric not in merged or f"{metric}_all_fast" not in merged:
@@ -146,7 +170,7 @@ def add_within_sample_z_targets(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def paired_comparisons(df: pd.DataFrame) -> pd.DataFrame:
+def paired_comparisons(df: pd.DataFrame, n_bootstrap: int) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     targets = ["delta_temp_raw", "delta_temp", "vbench_mean_delta"] + [
         f"{metric}_delta" for metric in ALL_METRICS if f"{metric}_delta" in df
@@ -163,7 +187,9 @@ def paired_comparisons(df: pd.DataFrame) -> pd.DataFrame:
             "random_mean": random_mean,
             "periodic": subset[subset["policy_family"] == "periodic"],
             "Amax_no_chunk0": subset[subset["policy_family"] == "Amax_no_chunk0"],
-            "oracle": subset[subset["policy_family"] == "oracle"],
+            "single_heavy_oracle": subset[subset["policy_family"] == "single_heavy_oracle"],
+            "all_fast": df[df["policy_family"] == "all_fast"],
+            "all_heavy": df[df["policy_family"] == "all_heavy"],
         }
         amax = subset[subset["policy_family"] == "Amax"]
         for comp_name, comp_df in comparators.items():
@@ -176,6 +202,11 @@ def paired_comparisons(df: pd.DataFrame) -> pd.DataFrame:
             )
             for target in targets:
                 diff = paired[f"{target}_Amax"] - paired[f"{target}_{comp_name}"]
+                ci_low, ci_high = bootstrap_mean_ci(
+                    diff,
+                    n_bootstrap=n_bootstrap,
+                    seed=stable_seed("router_pairwise", k, comp_name, target),
+                )
                 rows.append(
                     {
                         "k": int(k),
@@ -183,10 +214,43 @@ def paired_comparisons(df: pd.DataFrame) -> pd.DataFrame:
                         "target": target,
                         "n": int(diff.notna().sum()),
                         "mean_diff": float(diff.mean()),
+                        "mean_diff_ci_low": ci_low,
+                        "mean_diff_ci_high": ci_high,
                         "median_diff": float(diff.median()),
                         "win_rate": float((diff > 0).mean()),
                     }
                 )
+    return pd.DataFrame(rows)
+
+
+def oracle_recovery(table: pd.DataFrame) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    targets = ["delta_temp_raw", "delta_temp", "vbench_mean_delta"] + [
+        f"{metric}_delta" for metric in ALL_METRICS if f"{metric}_delta" in table
+    ]
+    for k in sorted(x for x in table["k"].dropna().unique() if x > 0):
+        subset = table[table["k"] == k]
+        amax = subset[subset["policy_family"] == "Amax"]
+        oracle = subset[subset["policy_family"] == "single_heavy_oracle"]
+        if amax.empty or oracle.empty:
+            continue
+        paired = amax[["prompt_id", "seed", *targets]].merge(
+            oracle[["prompt_id", "seed", *targets]],
+            on=["prompt_id", "seed"],
+            suffixes=("_Amax", "_single_heavy_oracle"),
+        )
+        for target in targets:
+            denom = paired[f"{target}_single_heavy_oracle"].replace(0, np.nan)
+            recovery = paired[f"{target}_Amax"] / denom
+            rows.append(
+                {
+                    "k": int(k),
+                    "target": target,
+                    "n": int(recovery.notna().sum()),
+                    "mean_recovery_to_single_heavy_oracle": float(recovery.mean()),
+                    "median_recovery_to_single_heavy_oracle": float(recovery.median()),
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -216,6 +280,7 @@ def main() -> None:
     parser.add_argument("--baseline_vbench", type=Path, default=Path("outputs/ar_teacher_long_keyframe_budget/vbench_analysis/vbench_video_records.csv"))
     parser.add_argument("--router_root", type=Path, default=Path("outputs/ar_teacher_long_router_policy"))
     parser.add_argument("--out_dir", type=Path, default=Path("outputs/ar_teacher_long_router_policy/analysis"))
+    parser.add_argument("--bootstrap", type=int, default=1000)
     args = parser.parse_args()
 
     router_records = load_video_records(args.router_vbench)
@@ -244,12 +309,14 @@ def main() -> None:
         )
         .sort_values(["k", "policy_family"])
     )
-    pairwise = paired_comparisons(table)
+    pairwise = paired_comparisons(table, n_bootstrap=args.bootstrap)
+    recovery_to_oracle = oracle_recovery(table)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     write_csv(args.out_dir / "router_policy_by_sample.csv", table)
     write_csv(args.out_dir / "router_policy_summary.csv", summary)
     write_csv(args.out_dir / "router_policy_pairwise_tests.csv", pairwise)
+    write_csv(args.out_dir / "router_policy_recovery_to_single_heavy_oracle.csv", recovery_to_oracle)
     write_csv(args.out_dir / "router_policy_chosen_chunks.csv", manifests)
     plot_policy_summary(summary, args.out_dir / "router_policy_plots")
 

@@ -1453,3 +1453,57 @@ All-heavy degradation is explained by simple transition-energy inflation.
 - The PCA residual uses final clean latents and an online low-rank basis over only 39 transitions. It may be too short/noisy to expose a strong DeltaTokens-style compressibility signal.
 - The latent replay should be deterministic relative to the generation metadata, but it is still a second forward pass rather than latents captured during original video generation.
 - Lean single-heavy storage preserves the exact quantities used here, but future analyses requiring the full single-heavy trajectory would need either full storage or another targeted extraction pass.
+
+## Corrected Router V2 Batch
+
+The first router-policy batch was useful as a policy diagnostic, but it omitted same-batch `all_fast` and `all_heavy` baselines. That made normalized recovery analysis underdetermined and forced comparisons against external AR-long baseline VBench results.
+
+The corrected v2 batch fixes the bookkeeping:
+
+```text
+output root:
+  outputs/ar_teacher_long_router_policy_v2
+
+policies per prompt-seed:
+  all_fast
+  all_heavy
+  Amax_top_k05
+  Amax_top_k10
+  periodic_k05
+  periodic_k10
+  random_k05_r00 ... random_k05_r19
+  random_k10_r00 ... random_k10_r19
+  single_heavy_oracle_k05
+  single_heavy_oracle_k10
+```
+
+The old `oracle_top_k` label is renamed to `single_heavy_oracle_k` because the ranking comes from previous single-heavy VBench deltas. It is an offline diagnostic upper bound, not a true multi-heavy interaction oracle.
+
+The corrected analysis should report:
+
+```text
+Amax - all_fast
+Amax - random_mean
+Amax - periodic
+Amax recovery toward single_heavy_oracle
+all_heavy - all_fast
+```
+
+Additional audit fixes:
+
+```text
+latent replay:
+  use_ema is read from rollout metadata instead of hardcoded false.
+
+H2 bad-chunk score:
+  z(Q) - z(D_max) is normalized within each prompt-seed sample.
+
+uncertainty:
+  Spearman/top-k/H2/router pairwise reports include bootstrap confidence intervals.
+```
+
+Results space:
+
+```text
+Pending corrected v2 generation and VBench.
+```

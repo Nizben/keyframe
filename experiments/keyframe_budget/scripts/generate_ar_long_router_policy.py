@@ -24,6 +24,7 @@ from experiments.keyframe_budget.runner import (
 )
 from experiments.keyframe_budget.schedules import (
     all_fast,
+    all_heavy,
     oracle_top_m,
     random_top_m,
     total_requested_steps,
@@ -84,13 +85,21 @@ def build_router_schedules(
     heavy_steps: int,
     prompt_id: str,
     seed: int,
+    random_replicates: int,
+    include_baselines: bool,
+    include_no_chunk0: bool,
+    oracle_prefix: str,
 ) -> Dict[str, List[int]]:
     schedules: Dict[str, List[int]] = {}
+    if include_baselines:
+        schedules["all_fast"] = all_fast(total_chunks, fast_steps)
+        schedules["all_heavy"] = all_heavy(total_chunks, heavy_steps)
+    random_width = 2 if random_replicates >= 10 else 1
     for k in POLICY_KS:
         schedules[f"periodic_k{k:02d}"] = uniform_top_m(total_chunks, fast_steps, heavy_steps, k)
-        for rep in RANDOM_REPLICATES:
+        for rep in range(random_replicates):
             random_seed = stable_int("router_random", prompt_id, seed, k, rep) % (2**31 - 1)
-            schedules[f"random_k{k:02d}_r{rep}"] = random_top_m(
+            schedules[f"random_k{k:02d}_r{rep:0{random_width}d}"] = random_top_m(
                 total_chunks, fast_steps, heavy_steps, k, seed=random_seed
             )
         schedules[f"Amax_top_k{k:02d}"] = oracle_top_m(
@@ -100,14 +109,15 @@ def build_router_schedules(
             k,
             ranked_chunk_indices=top_indices(group, "A_max", k),
         )
-        schedules[f"Amax_top_k{k:02d}_no_chunk0"] = oracle_top_m(
-            total_chunks,
-            fast_steps,
-            heavy_steps,
-            k,
-            ranked_chunk_indices=top_indices(group, "A_max", k, exclude_chunk0=True),
-        )
-        schedules[f"oracle_top_k{k:02d}"] = oracle_top_m(
+        if include_no_chunk0:
+            schedules[f"Amax_top_k{k:02d}_no_chunk0"] = oracle_top_m(
+                total_chunks,
+                fast_steps,
+                heavy_steps,
+                k,
+                ranked_chunk_indices=top_indices(group, "A_max", k, exclude_chunk0=True),
+            )
+        schedules[f"{oracle_prefix}_k{k:02d}"] = oracle_top_m(
             total_chunks,
             fast_steps,
             heavy_steps,
@@ -128,6 +138,14 @@ def assert_router_schedules(
             raise ValueError(f"{name}: expected {total_chunks} chunks, got {len(schedule)}")
         if any(int(x) not in {fast_steps, heavy_steps} for x in schedule):
             raise ValueError(f"{name}: schedule contains steps outside {{{fast_steps}, {heavy_steps}}}")
+        if name == "all_fast":
+            if any(int(x) != fast_steps for x in schedule):
+                raise ValueError("all_fast contains a heavy chunk")
+            continue
+        if name == "all_heavy":
+            if any(int(x) != heavy_steps for x in schedule):
+                raise ValueError("all_heavy contains a fast chunk")
+            continue
         if name.startswith("periodic_k"):
             k = int(name.split("_k", 1)[1])
             if selected_indices(schedule, heavy_steps) != uniform_top_m_indices(total_chunks, k):
@@ -136,6 +154,8 @@ def assert_router_schedules(
             raise ValueError(f"{name}: no_chunk0 policy selected chunk 0")
     totals_by_k: Dict[str, set[int]] = {}
     for name, schedule in schedules.items():
+        if name in {"all_fast", "all_heavy"}:
+            continue
         k_token = name.split("_k", 1)[1].split("_", 1)[0]
         totals_by_k.setdefault(k_token, set()).add(total_requested_steps(schedule))
     bad = {k: totals for k, totals in totals_by_k.items() if len(totals) != 1}
@@ -184,8 +204,14 @@ def main() -> None:
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--backend", type=str, default="default")
     parser.add_argument("--device", type=str, default="")
+    parser.add_argument("--random_replicates", type=int, default=len(RANDOM_REPLICATES))
+    parser.add_argument("--include_baselines", action="store_true")
+    parser.add_argument("--skip_no_chunk0", action="store_true")
+    parser.add_argument("--oracle_prefix", type=str, default="oracle_top")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    if args.random_replicates < 0:
+        raise ValueError("--random_replicates must be non-negative")
 
     prompt_index = args.task_id // 3
     seed = args.task_id % 3
@@ -219,6 +245,10 @@ def main() -> None:
         heavy_steps=args.heavy_steps,
         prompt_id=prompt_id,
         seed=seed,
+        random_replicates=args.random_replicates,
+        include_baselines=args.include_baselines,
+        include_no_chunk0=not args.skip_no_chunk0,
+        oracle_prefix=args.oracle_prefix,
     )
     assert_router_schedules(schedules, total_chunks, args.fast_steps, args.heavy_steps)
     write_policy_manifest(args.output_root, experiment_name, prompt_id, seed, schedules, args.heavy_steps)

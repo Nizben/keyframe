@@ -149,7 +149,7 @@ def save_latents_for_experiment(
     first_meta = read_json(find_schedule_meta(exp_dir, "all_fast"))
     config_path = str(first_meta.get("model_config_path") or first_meta.get("config_path"))
     checkpoint = str(first_meta["checkpoint"])
-    use_ema = False
+    use_ema = bool(first_meta.get("use_ema", False))
     backend = str(first_meta.get("backend", "default"))
     dtype = parse_dtype(dtype_name or str(first_meta.get("dtype", "bfloat16")))
     loaded_config = load_merged_config(config_path)
@@ -232,6 +232,7 @@ def save_latents_for_experiment(
                 "chunk_frames": num_frame_per_block,
                 "checkpoint": checkpoint,
                 "config_path": config_path,
+                "use_ema": use_ema,
                 "source_rollout_meta": str(meta_path),
             }
             write_json(
