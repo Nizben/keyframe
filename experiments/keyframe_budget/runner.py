@@ -20,8 +20,16 @@ from torchvision.io import write_video
 from pipeline import CausalDiffusionInferencePipeline
 from utils.misc import set_seed
 
+from .boundaries import build_chunk_boundaries, write_chunk_boundaries
 from .metrics import MetricAdapter, VideoMetrics, evaluate_video_metrics
 from .schedules import total_requested_steps
+
+try:
+    from long_video.pipeline.causal_diffusion_inference import (  # type: ignore
+        CausalDiffusionInferencePipeline as LongVideoCausalDiffusionInferencePipeline,
+    )
+except Exception:
+    LongVideoCausalDiffusionInferencePipeline = None
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +54,11 @@ class RolloutSpec:
     strict_step_match: bool = True
     debug_cache_logs: bool = False
     start_frame_index: int = 0
+    backend: str = "default"
+    model_config_path: Optional[str] = None
+    suffix_window_latent: int = 32
+    latent_to_visible_ratio: int = 4
+    save_chunk_boundaries: bool = False
 
 
 @dataclass(frozen=True)
@@ -178,12 +191,21 @@ def load_pipeline(
     dtype: str = "bfloat16",
     strict_step_match: bool = True,
     debug_cache_logs: bool = False,
-) -> Tuple[CausalDiffusionInferencePipeline, Any]:
+    backend: str = "default",
+) -> Tuple[torch.nn.Module, Any]:
     config = load_merged_config(config_path)
     config.enforce_chunk_step_match = strict_step_match
     config.debug_cache_logs = debug_cache_logs
 
-    pipeline = CausalDiffusionInferencePipeline(config, device=device)
+    backend_name = backend.lower()
+    if backend_name == "long_video":
+        if LongVideoCausalDiffusionInferencePipeline is None:
+            raise RuntimeError(
+                "backend=long_video requested, but long_video pipeline import failed."
+            )
+        pipeline = LongVideoCausalDiffusionInferencePipeline(config, device=device)
+    else:
+        pipeline = CausalDiffusionInferencePipeline(config, device=device)
     state_dict = torch.load(str(_as_repo_path(checkpoint_path)), map_location="cpu")
     key = "generator_ema" if use_ema else "generator"
     generator_state = state_dict.get(key, state_dict)
@@ -213,7 +235,7 @@ def load_merged_config(config_path: str):
     return OmegaConf.merge(default_config, config)
 
 
-def _cleanup_pipeline_memory(pipeline: Optional[CausalDiffusionInferencePipeline]) -> None:
+def _cleanup_pipeline_memory(pipeline: Optional[torch.nn.Module]) -> None:
     if pipeline is not None:
         for attr in ("kv_cache_pos", "kv_cache_neg", "crossattn_cache_pos", "crossattn_cache_neg"):
             if hasattr(pipeline, attr):
@@ -244,12 +266,16 @@ def _create_rollout_failure_meta(
         "seed": spec.seed,
         "checkpoint": spec.checkpoint,
         "config_path": spec.config_path,
+        "model_config_path": spec.model_config_path or spec.config_path,
+        "backend": spec.backend,
         "schedule_name": spec.schedule_name,
         "steps_per_chunk": spec.steps_per_chunk,
         "num_chunks": len(spec.steps_per_chunk),
+        "suffix_window_latent": spec.suffix_window_latent,
+        "latent_to_visible_ratio": spec.latent_to_visible_ratio,
         "wall_clock_sec": 0.0,
         "total_nfe": 0,
-        "video_path": str(rollout_dir / "video.mp4"),
+        "video_path": str(rollout_dir / "full.mp4"),
         "thumbnail_dir": str(rollout_dir / "thumbs"),
         "metrics_path": str(rollout_dir / "metrics.json"),
         "status": "failed",
@@ -260,7 +286,7 @@ def _create_rollout_failure_meta(
 
 def run_rollout(
     spec: RolloutSpec,
-    pipeline: Optional[CausalDiffusionInferencePipeline] = None,
+    pipeline: Optional[torch.nn.Module] = None,
     loaded_config: Optional[Any] = None,
     device: Optional[torch.device] = None,
     force: bool = False,
@@ -280,7 +306,8 @@ def run_rollout(
     rollout_dir.mkdir(parents=True, exist_ok=True)
     rollout_meta_path = rollout_dir / "rollout_meta.json"
     metrics_path = rollout_dir / "metrics.json"
-    video_path = rollout_dir / "video.mp4"
+    video_path = rollout_dir / "full.mp4"
+    boundaries_path = rollout_dir / "chunk_boundaries.json"
 
     if rollout_meta_path.exists() and not force:
         existing = _read_json(rollout_meta_path)
@@ -305,13 +332,14 @@ def run_rollout(
 
     if pipeline is None:
         pipeline, loaded_config = load_pipeline(
-            config_path=spec.config_path,
+            config_path=spec.model_config_path or spec.config_path,
             checkpoint_path=spec.checkpoint,
             use_ema=spec.use_ema,
             device=device,
             dtype=spec.dtype,
             strict_step_match=spec.strict_step_match,
             debug_cache_logs=spec.debug_cache_logs,
+            backend=spec.backend,
         )
     elif loaded_config is None:
         loaded_config = pipeline.args
@@ -337,14 +365,24 @@ def run_rollout(
         )
         rollout_start = time.perf_counter()
         with torch.inference_mode():
-            video, latents, chunk_logs = pipeline.inference(
-                noise=sampled_noise,
-                text_prompts=[spec.prompt_text],
-                return_latents=True,
-                start_frame_index=spec.start_frame_index,
-                steps_per_chunk=spec.steps_per_chunk,
-                return_chunk_logs=True,
-            )
+            try:
+                video, latents, chunk_logs = pipeline.inference(
+                    noise=sampled_noise,
+                    text_prompts=[spec.prompt_text],
+                    return_latents=True,
+                    start_frame_index=spec.start_frame_index,
+                    steps_per_chunk=spec.steps_per_chunk,
+                    return_chunk_logs=True,
+                )
+            except TypeError:
+                # Backward compatibility with older pipeline signatures.
+                video, latents = pipeline.inference(
+                    noise=sampled_noise,
+                    text_prompts=[spec.prompt_text],
+                    return_latents=True,
+                    start_frame_index=spec.start_frame_index,
+                )
+                chunk_logs = []
         wall_clock_sec = time.perf_counter() - rollout_start
 
         out_video = rearrange(video, "b t c h w -> b t h w c").cpu()
@@ -362,18 +400,35 @@ def run_rollout(
         _write_json_atomic(metrics_path, metric_result.values)
 
         total_nfe = int(sum(int(item.get("actual_num_steps", 0)) for item in chunk_logs))
+        requested_total_steps = total_requested_steps(spec.steps_per_chunk)
         step_mismatch_chunks = [
             int(item.get("chunk_idx", -1))
             for item in chunk_logs
             if int(item.get("actual_num_steps", -1)) != int(item.get("requested_num_steps", -2))
         ]
+        decoded_total_frames = int(out_video.shape[1])
+        boundary_payload = build_chunk_boundaries(
+            num_output_frames=spec.num_output_frames,
+            num_frame_per_block=int(getattr(loaded_config, "num_frame_per_block", 1)),
+            independent_first_frame=bool(getattr(loaded_config, "independent_first_frame", False)),
+            latent_to_visible_ratio=spec.latent_to_visible_ratio,
+            decoded_total_frames=decoded_total_frames,
+            fps=spec.fps,
+            suffix_window_latent=spec.suffix_window_latent,
+        )
+        if spec.save_chunk_boundaries:
+            write_chunk_boundaries(boundaries_path, boundary_payload)
+
+        budget_match_ok = bool(chunk_logs) and (requested_total_steps == total_nfe)
         rollout_meta: Dict[str, Any] = {
             "experiment_name": spec.experiment_name,
             "prompt_id": spec.prompt_id,
             "prompt_text": spec.prompt_text,
             "seed": spec.seed,
+            "backend": spec.backend,
             "checkpoint": spec.checkpoint,
             "config_path": spec.config_path,
+            "model_config_path": spec.model_config_path or spec.config_path,
             "schedule_name": spec.schedule_name,
             "steps_per_chunk": list(spec.steps_per_chunk),
             "num_chunks": num_chunks,
@@ -382,16 +437,23 @@ def run_rollout(
             "target_avg_steps": float(sum(spec.steps_per_chunk) / len(spec.steps_per_chunk)),
             "wall_clock_sec": wall_clock_sec,
             "total_nfe": total_nfe,
-            "requested_total_steps": total_requested_steps(spec.steps_per_chunk),
+            "requested_total_steps": requested_total_steps,
+            "decoded_total_frames": decoded_total_frames,
+            "fps": spec.fps,
+            "suffix_window_latent": spec.suffix_window_latent,
+            "latent_to_visible_ratio": spec.latent_to_visible_ratio,
             "video_path": str(video_path),
             "thumbnail_dir": str(rollout_dir / "thumbs"),
             "metrics_path": str(metrics_path),
+            "chunk_boundaries_path": str(boundaries_path),
             "status": "success",
             "score": metric_result.score,
             "chunk_logs": chunk_logs,
             "latent_shape": list(latents.shape),
             "step_mismatch_chunks": step_mismatch_chunks,
             "step_match_ok": len(step_mismatch_chunks) == 0,
+            "budget_match_ok": budget_match_ok,
+            "chunk_boundaries": boundary_payload,
         }
         _write_json_atomic(rollout_meta_path, rollout_meta)
         _cleanup_pipeline_memory(pipeline)

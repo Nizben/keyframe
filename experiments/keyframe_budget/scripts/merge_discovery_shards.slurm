@@ -15,8 +15,10 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$WORK/Causal-Forcing}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/keyframe_budget}"
+SHARD_GLOB_PREFIX="${SHARD_GLOB_PREFIX:-discovery_split_p*_s*}"
+MERGED_EXPERIMENT_NAME="${MERGED_EXPERIMENT_NAME:-discovery_split}"
 
-export ROOT_DIR OUTPUT_ROOT
+export ROOT_DIR OUTPUT_ROOT SHARD_GLOB_PREFIX MERGED_EXPERIMENT_NAME
 python3 - <<'PY'
 import glob
 import os
@@ -27,13 +29,15 @@ root_dir = Path(os.environ["ROOT_DIR"]).resolve()
 output_root = Path(os.environ["OUTPUT_ROOT"])
 if not output_root.is_absolute():
     output_root = (root_dir / output_root).resolve()
+shard_glob_prefix = os.environ["SHARD_GLOB_PREFIX"]
+merged_experiment_name = os.environ["MERGED_EXPERIMENT_NAME"]
 
-source_pattern = str(output_root / "discovery_split_p*_s*" / "aggregates" / "prompt_seed_aggregates" / "*.json")
+source_pattern = str(output_root / shard_glob_prefix / "aggregates" / "prompt_seed_aggregates" / "*.json")
 source_files = sorted(glob.glob(source_pattern))
 if not source_files:
     raise FileNotFoundError(f"No discovery shard aggregate files found: {source_pattern}")
 
-dest_aggregate_root = output_root / "discovery_split" / "aggregates"
+dest_aggregate_root = output_root / merged_experiment_name / "aggregates"
 dest_prompt_dir = dest_aggregate_root / "prompt_seed_aggregates"
 dest_prompt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -48,11 +52,12 @@ for jsonl_name in ("gain_maps.jsonl", "policy_results.jsonl"):
     dest_jsonl = dest_aggregate_root / jsonl_name
     dest_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with dest_jsonl.open("w", encoding="utf-8") as out_f:
-        shard_pattern = str(output_root / "discovery_split_p*_s*" / "aggregates" / jsonl_name)
+        shard_pattern = str(output_root / shard_glob_prefix / "aggregates" / jsonl_name)
         for shard_path in sorted(glob.glob(shard_pattern)):
             with open(shard_path, "r", encoding="utf-8") as in_f:
                 out_f.write(in_f.read())
 
 print(f"[merge-discovery] copied prompt_seed aggregates: {len(source_files)}")
+print(f"[merge-discovery] source shard glob: {shard_glob_prefix}")
 print(f"[merge-discovery] destination: {dest_prompt_dir}")
 PY

@@ -46,6 +46,35 @@ resolve_snapshot_dir() {
   return 1
 }
 
+is_long_video_config() {
+  local cfg_path="$1"
+  python - <<'PY' "$cfg_path"
+import os
+import sys
+from omegaconf import OmegaConf
+
+cfg_path = sys.argv[1]
+try:
+    cfg = OmegaConf.load(cfg_path)
+except Exception:
+    print("0")
+    raise SystemExit(0)
+
+backend = str(cfg.get("backend", "") or "").lower()
+model_config_path = str(cfg.get("model_config_path", "") or "").lower()
+checkpoint = str(cfg.get("checkpoint", "") or "").lower()
+if (
+    backend == "long_video"
+    or "long_video" in model_config_path
+    or checkpoint.endswith("/longvideo.pt")
+    or checkpoint.endswith("longvideo.pt")
+):
+    print("1")
+else:
+    print("0")
+PY
+}
+
 ROOT_DIR=${ROOT_DIR:-$WORK/Causal-Forcing}
 CONFIG_PATH=${EXP_CONFIG:-experiments/keyframe_budget/configs/smoke_test.yaml}
 TMP_CONFIG=${SLURM_TMPDIR:-/tmp}/kfb_${SLURM_JOB_ID:-manual}.yaml
@@ -73,9 +102,16 @@ fi
 if [ -n "${CF_SNAPSHOT_DIR:-}" ] && [ ! -e "checkpoints/chunkwise/ar_diffusion.pt" ] && [ -f "${CF_SNAPSHOT_DIR}/chunkwise/ar_diffusion.pt" ]; then
   ln -s "${CF_SNAPSHOT_DIR}/chunkwise/ar_diffusion.pt" "checkpoints/chunkwise/ar_diffusion.pt"
 fi
+if [ -n "${CF_SNAPSHOT_DIR:-}" ] && [ ! -e "checkpoints/chunkwise/longvideo.pt" ] && [ -f "${CF_SNAPSHOT_DIR}/chunkwise/longvideo.pt" ]; then
+  ln -s "${CF_SNAPSHOT_DIR}/chunkwise/longvideo.pt" "checkpoints/chunkwise/longvideo.pt"
+fi
 
 CHECKPOINT_PATH=${CHECKPOINT_PATH:-}
-if [ -z "$CHECKPOINT_PATH" ] && [ -n "${CF_SNAPSHOT_DIR:-}" ] && [ -f "${CF_SNAPSHOT_DIR}/chunkwise/ar_diffusion.pt" ]; then
+LONG_VIDEO_FLAG="$(is_long_video_config "$CONFIG_PATH")"
+if [ -z "$CHECKPOINT_PATH" ] && [ "$LONG_VIDEO_FLAG" = "1" ] && [ -n "${CF_SNAPSHOT_DIR:-}" ] && [ -f "${CF_SNAPSHOT_DIR}/chunkwise/longvideo.pt" ]; then
+  CHECKPOINT_PATH="${CF_SNAPSHOT_DIR}/chunkwise/longvideo.pt"
+fi
+if [ -z "$CHECKPOINT_PATH" ] && [ "$LONG_VIDEO_FLAG" != "1" ] && [ -n "${CF_SNAPSHOT_DIR:-}" ] && [ -f "${CF_SNAPSHOT_DIR}/chunkwise/ar_diffusion.pt" ]; then
   CHECKPOINT_PATH="${CF_SNAPSHOT_DIR}/chunkwise/ar_diffusion.pt"
 fi
 
@@ -109,6 +145,14 @@ if os.environ.get("ORACLE_SOURCE"):
     cfg["oracle_source"] = os.environ["ORACLE_SOURCE"]
 if os.environ.get("DTYPE"):
     cfg["dtype"] = os.environ["DTYPE"]
+if os.environ.get("SINGLE_HEAVY_INDICES"):
+    cfg["single_heavy_indices"] = [
+        int(x.strip()) for x in os.environ["SINGLE_HEAVY_INDICES"].split(",") if x.strip()
+    ]
+if os.environ.get("EXPECTED_CHECKPOINT_BASENAME"):
+    cfg["expected_checkpoint_basename"] = os.environ["EXPECTED_CHECKPOINT_BASENAME"]
+if os.environ.get("FORBIDDEN_BACKEND"):
+    cfg["forbidden_backend"] = os.environ["FORBIDDEN_BACKEND"]
 
 for env_key, cfg_key in {
     "NUM_PROMPTS": "num_prompts",
@@ -131,6 +175,8 @@ if os.getenv("USE_EMA") is not None:
     cfg["use_ema"] = parse_bool(os.getenv("USE_EMA"))
 if os.getenv("DEBUG_CACHE_LOGS") is not None:
     cfg["debug_cache_logs"] = parse_bool(os.getenv("DEBUG_CACHE_LOGS"))
+if os.getenv("SAVE_CHUNK_BOUNDARIES") is not None:
+    cfg["save_chunk_boundaries"] = parse_bool(os.getenv("SAVE_CHUNK_BOUNDARIES"))
 
 for key in ("checkpoint", "model_config_path", "prompt_set", "output_root"):
     value = cfg.get(key, "")

@@ -1,0 +1,21 @@
+experiment_name: ar_teacher_5s_discovery
+output_root: outputs/ar_teacher_keyframe_5s
+model_config_path: configs/ar_diffusion_tf_chunkwise.yaml
+checkpoint: checkpoints/chunkwise/ar_diffusion.pt
+use_ema: false
+dtype: bfloat16
+
+# Chunkwise AR teacher test: 21 latent frames with 3 frames per block gives
+# 7 independently budgeted chunks, decoded to about 5.1 seconds at 16 fps.
+fast_steps: 8
+heavy_steps: 24
+target_avg_steps: 12
+
+num_output_frames: 21
+num_prompts: 24
+seeds: [0, 1, 2]
+prompt_set: experiments/keyframe_budget/prompts/motion_rich_24.json
+
+run_exhaustive_single_heavy: true
+run_policy_comparison: false
+debug_cache_logs: false

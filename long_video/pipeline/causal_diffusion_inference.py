@@ -52,7 +52,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         text_prompts: List[str],
         initial_latent: Optional[torch.Tensor] = None,
         return_latents: bool = False,
-        start_frame_index: Optional[int] = 0
+        start_frame_index: Optional[int] = 0,
+        steps_per_chunk: Optional[List[int]] = None,
+        return_chunk_logs: bool = False,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -82,6 +84,16 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             num_blocks = (num_frames - 1) // self.num_frame_per_block
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
         num_output_frames = num_frames + num_input_frames  # add the initial latent frames
+        chunk_logs = []
+
+        if steps_per_chunk is not None:
+            if len(steps_per_chunk) != num_blocks:
+                raise ValueError(
+                    f"steps_per_chunk length mismatch: expected {num_blocks}, got {len(steps_per_chunk)}"
+                )
+            for idx, step_count in enumerate(steps_per_chunk):
+                if int(step_count) <= 0:
+                    raise ValueError(f"steps_per_chunk[{idx}] must be > 0, got {step_count}")
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
@@ -187,13 +199,14 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
-        for current_num_frames in all_num_frames:
+        for chunk_idx, current_num_frames in enumerate(all_num_frames):
             noisy_input = noise[
                 :, cache_start_frame - num_input_frames:cache_start_frame + current_num_frames - num_input_frames]
             latents = noisy_input
 
             # Step 3.1: Spatial denoising loop
-            sample_scheduler = self._initialize_sample_scheduler(noise)
+            sampling_steps = int(steps_per_chunk[chunk_idx]) if steps_per_chunk is not None else int(self.sampling_steps)
+            sample_scheduler = self._initialize_sample_scheduler(noise, sampling_steps=sampling_steps)
             for _, t in enumerate(tqdm(sample_scheduler.timesteps)):
                 latent_model_input = latents
                 timestep = t * torch.ones(
@@ -228,8 +241,16 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     latents,
                     return_dict=False)[0]
                 latents = temp_x0
-                print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
-                print(f"kv_cache['global_end_index']: {self.kv_cache_pos[0]['global_end_index']}")
+            chunk_logs.append(
+                {
+                    "chunk_idx": int(chunk_idx),
+                    "chunk_num_frames": int(current_num_frames),
+                    "requested_num_steps": int(sampling_steps),
+                    "actual_num_steps": int(len(sample_scheduler.timesteps)),
+                    "cache_start_frame": int(cache_start_frame),
+                    "current_start_frame": int(current_start_frame),
+                }
+            )
 
             # Step 3.2: record the model's output
             output[:, cache_start_frame:cache_start_frame + current_num_frames] = latents
@@ -262,8 +283,12 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         video = self.vae.decode_to_pixel(output)
         video = (video * 0.5 + 0.5).clamp(0, 1)
 
+        if return_latents and return_chunk_logs:
+            return video, output, chunk_logs
         if return_latents:
             return video, output
+        if return_chunk_logs:
+            return video, chunk_logs
         else:
             return video
 
@@ -318,21 +343,24 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.crossattn_cache_pos = crossattn_cache_pos  # always store the clean cache
         self.crossattn_cache_neg = crossattn_cache_neg  # always store the clean cache
 
-    def _initialize_sample_scheduler(self, noise):
+    def _initialize_sample_scheduler(self, noise, sampling_steps: Optional[int] = None):
+        sampling_steps = int(sampling_steps) if sampling_steps is not None else int(self.sampling_steps)
+        if sampling_steps <= 0:
+            raise ValueError(f"sampling_steps must be > 0, got {sampling_steps}")
         if self.sample_solver == 'unipc':
             sample_scheduler = FlowUniPCMultistepScheduler(
                 num_train_timesteps=self.num_train_timesteps,
                 shift=1,
                 use_dynamic_shifting=False)
             sample_scheduler.set_timesteps(
-                self.sampling_steps, device=noise.device, shift=self.shift)
+                sampling_steps, device=noise.device, shift=self.shift)
             self.timesteps = sample_scheduler.timesteps
         elif self.sample_solver == 'dpm++':
             sample_scheduler = FlowDPMSolverMultistepScheduler(
                 num_train_timesteps=self.num_train_timesteps,
                 shift=1,
                 use_dynamic_shifting=False)
-            sampling_sigmas = get_sampling_sigmas(self.sampling_steps, self.shift)
+            sampling_sigmas = get_sampling_sigmas(sampling_steps, self.shift)
             self.timesteps, _ = retrieve_timesteps(
                 sample_scheduler,
                 device=noise.device,

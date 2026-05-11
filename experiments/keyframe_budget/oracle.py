@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .runner import RolloutResult, RolloutSpec, run_rollout
 from .schedules import single_heavy_at_i
@@ -61,6 +61,7 @@ def exhaustive_single_heavy_sweep(
     base_spec: RolloutSpec,
     fast_steps: int,
     heavy_steps: int,
+    single_heavy_indices: Optional[Sequence[int]] = None,
     force: bool = False,
     pipeline=None,
     loaded_config=None,
@@ -69,6 +70,19 @@ def exhaustive_single_heavy_sweep(
     total_chunks = len(base_spec.steps_per_chunk)
     if total_chunks <= 0:
         raise ValueError("base_spec.steps_per_chunk must not be empty.")
+    if single_heavy_indices is None:
+        heavy_indices = list(range(total_chunks))
+    else:
+        heavy_indices = []
+        seen = set()
+        for idx in single_heavy_indices:
+            idx = int(idx)
+            if idx in seen:
+                continue
+            if idx < 0 or idx >= total_chunks:
+                raise IndexError(f"single_heavy index out of range: {idx} for total_chunks={total_chunks}")
+            heavy_indices.append(idx)
+            seen.add(idx)
 
     out: Dict[str, RolloutResult] = {}
     all_fast_spec = RolloutSpec(
@@ -92,7 +106,7 @@ def exhaustive_single_heavy_sweep(
         device=device,
     )
 
-    for chunk_idx in range(total_chunks):
+    for chunk_idx in heavy_indices:
         schedule = single_heavy_at_i(
             total_chunks=total_chunks,
             fast_steps=fast_steps,
@@ -112,4 +126,3 @@ def exhaustive_single_heavy_sweep(
         )
 
     return out
-

@@ -1,0 +1,27 @@
+experiment_name: causal_forcing_student_long_discovery
+output_root: outputs/causal_forcing_student_long_keyframe_budget
+model_config_path: configs/causal_forcing_dmd_chunkwise.yaml
+checkpoint: checkpoints/chunkwise/causal_forcing.pt
+backend: causal_forcing_student
+use_ema: false
+dtype: bfloat16
+
+# 4-step causal-forcing student long rollout: 120 latent frames with
+# 3 frames per causal chunk gives 40 budgeted chunks.
+fast_steps: 2
+heavy_steps: 4
+target_avg_steps: 3
+
+num_output_frames: 120
+fps: 16
+num_prompts: 24
+seeds: [0, 1, 2]
+prompt_set: experiments/keyframe_budget/prompts/motion_rich_24.json
+
+run_exhaustive_single_heavy: true
+run_policy_comparison: false
+save_chunk_boundaries: true
+suffix_window_latent: 32
+latent_to_visible_ratio: 4
+
+expected_checkpoint_basename: causal_forcing.pt

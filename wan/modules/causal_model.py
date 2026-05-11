@@ -207,29 +207,44 @@ class CausalWanSelfAttention(nn.Module):
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+            if (current_end > kv_cache["global_end_index"].item()) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
                 # Calculate the number of new tokens added in this step
                 # Shift existing cache content left to discard oldest tokens
                 # Clone the source slice to avoid overlapping memory error
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
-                kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                num_evicted_tokens = max(
+                    0, min(kv_cache_size, num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size)
+                )
+                num_rolled_tokens = max(0, kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens)
+                if num_rolled_tokens > 0:
+                    kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        kv_cache["k"][
+                            :,
+                            sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens
+                        ].clone()
+                    kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                        kv_cache["v"][
+                            :,
+                            sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens
+                        ].clone()
                 # Insert the new keys/values at the end
                 local_end_index = kv_cache["local_end_index"].item() + current_end - \
                     kv_cache["global_end_index"].item() - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
             else:
                 # Assign new keys/values directly up to current_end
                 local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
                 local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
-                kv_cache["v"][:, local_start_index:local_end_index] = v
+            local_start_index = max(0, local_start_index)
+            local_end_index = min(kv_cache_size, local_end_index)
+            write_len = local_end_index - local_start_index
+            if write_len <= 0:
+                raise RuntimeError(
+                    f"Invalid KV-cache write window: start={local_start_index}, "
+                    f"end={local_end_index}, size={kv_cache_size}"
+                )
+            kv_cache["k"][:, local_start_index:local_end_index] = roped_key[:, -write_len:]
+            kv_cache["v"][:, local_start_index:local_end_index] = v[:, -write_len:]
             x = attention(
                 roped_query,
                 kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
