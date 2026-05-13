@@ -1548,9 +1548,9 @@ all_fast
 all_heavy
 random_k05_h24_r00 ... random_k05_h24_r19
 Amax_k05_h24
-S_instability_k05_h24
-AplusS_k05_h24
-AmulS_k05_h24
+S_top_k05_h24
+AplusS_top_k05_h24
+AtimesS_top_k05_h24
 Amax_k05_h12
 Amax_k05_h16
 Amax_k05_h20
@@ -1570,9 +1570,9 @@ Total cohorts:
 Primary comparisons:
 
 ```text
-AplusS_k05_h24 vs random mean
-AplusS_k05_h24 vs Amax_k05_h24
-S_instability_k05_h24 vs Amax_k05_h24
+AplusS_top_k05_h24 vs random mean
+AplusS_top_k05_h24 vs Amax_k05_h24
+S_top_k05_h24 vs Amax_k05_h24
 Amax step-size curve: h12, h16, h20, h24
 Amax_k05_h24 vs global/imaging/temporal single-heavy oracles
 ```
@@ -1580,7 +1580,7 @@ Amax_k05_h24 vs global/imaging/temporal single-heavy oracles
 Win condition:
 
 ```text
-AplusS_k05_h24 improves vbench_mean_delta over random
+AplusS_top_k05_h24 improves vbench_mean_delta over random
 and improves delta_temp_raw more clearly than Amax_k05_h24.
 ```
 

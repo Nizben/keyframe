@@ -84,12 +84,12 @@ def parse_policy(policy_name: str) -> Tuple[str, int]:
         return "random", 24
     if policy_name.startswith("Amax_k05_h"):
         return "Amax", int(policy_name.rsplit("_h", 1)[1])
-    if policy_name.startswith("S_instability"):
-        return "S_instability", 24
-    if policy_name.startswith("AplusS"):
+    if policy_name.startswith("S_top"):
+        return "S", 24
+    if policy_name.startswith("AplusS_top"):
         return "AplusS", 24
-    if policy_name.startswith("AmulS"):
-        return "AmulS", 24
+    if policy_name.startswith("AtimesS_top"):
+        return "AtimesS", 24
     if policy_name.startswith("global_mean_oracle"):
         return "global_mean_oracle", 24
     if policy_name.startswith("imaging_oracle"):
@@ -153,7 +153,7 @@ def build_pairwise(table: pd.DataFrame) -> pd.DataFrame:
         numeric_only=True
     )
     comparisons = []
-    for policy in ("Amax_k05_h24", "S_instability_k05_h24", "AplusS_k05_h24", "AmulS_k05_h24"):
+    for policy in ("Amax_k05_h24", "S_top_k05_h24", "AplusS_top_k05_h24", "AtimesS_top_k05_h24"):
         comparisons.append(paired_against(table, policy, random_mean, "random_mean"))
         if policy != "Amax_k05_h24":
             comparisons.append(paired_against(table, policy, table[table["policy_name"] == "Amax_k05_h24"], "Amax_k05_h24"))
@@ -199,9 +199,9 @@ def plot_summaries(summary: pd.DataFrame, out_dir: Path) -> None:
         policy_order = [
             "random",
             "Amax",
-            "S_instability",
+            "S",
             "AplusS",
-            "AmulS",
+            "AtimesS",
             "global_mean_oracle",
             "imaging_oracle",
             "temporal_oracle",

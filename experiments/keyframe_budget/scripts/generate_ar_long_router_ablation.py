@@ -31,8 +31,7 @@ from experiments.keyframe_budget.schedules import (
 )
 
 
-DEFAULT_SCORES = Path("outputs/ar_teacher_long_keyframe_budget/compression_transition/compression_vbench_table.parquet")
-DEFAULT_INSTABILITY = Path("outputs/ar_teacher_long_router_ablation/solver_instability_scores.parquet")
+DEFAULT_SCORES = Path("outputs/ar_teacher_long_router_ablation/compression_vbench_with_solver_instability.parquet")
 DEFAULT_OUTPUT_ROOT = Path("outputs/ar_teacher_long_router_ablation")
 DEFAULT_PROMPTS = Path("experiments/keyframe_budget/prompts/motion_rich_24.json")
 DEFAULT_CONFIG = "configs/ar_diffusion_tf_chunkwise.yaml"
@@ -89,35 +88,25 @@ def metric_oracle_score(group: pd.DataFrame, metric_cols: Sequence[str]) -> pd.S
     return pd.concat(z_cols, axis=1).mean(axis=1)
 
 
-def load_score_group(scores_path: Path, instability_path: Path, prompt_id: str, seed: int) -> pd.DataFrame:
+def load_score_group(scores_path: Path, prompt_id: str, seed: int) -> pd.DataFrame:
     scores = pd.read_parquet(scores_path)
     group = scores[
         (scores["prompt_id"].astype(str) == str(prompt_id)) & (scores["seed"].astype(int) == int(seed))
     ].copy()
     if len(group) != 40:
         raise RuntimeError(f"Expected 40 score rows for {prompt_id} seed={seed}, got {len(group)}")
-
-    instability = pd.read_parquet(instability_path)
-    s_group = instability[
-        (instability["prompt_id"].astype(str) == str(prompt_id)) & (instability["seed"].astype(int) == int(seed))
-    ][["heavy_idx", "S_instability"]].copy()
-    if len(s_group) != 40:
-        raise RuntimeError(f"Expected 40 instability rows for {prompt_id} seed={seed}, got {len(s_group)}")
-
+    required = {"A_max", "S_instability", "AplusS", "AtimesS"}
+    missing = sorted(required - set(group.columns))
+    if missing:
+        raise RuntimeError(f"Scores table is missing router columns {missing}. Run merge_solver_instability_with_compression.py first.")
     group["heavy_idx"] = group["heavy_idx"].astype(int)
-    s_group["heavy_idx"] = s_group["heavy_idx"].astype(int)
-    out = group.merge(s_group, on="heavy_idx", how="inner")
-    if len(out) != 40:
-        raise RuntimeError(f"Score/S merge lost rows for {prompt_id} seed={seed}: got {len(out)}")
-
-    out["Amax_z"] = zscore(out["A_max"].astype(float))
-    out["S_z"] = zscore(out["S_instability"].astype(float))
-    out["AplusS"] = out["Amax_z"] + out["S_z"]
-    out["AmulS"] = out["Amax_z"] * out["S_z"]
-    out["global_mean_oracle"] = metric_oracle_score(out, [f"{m}_delta" for m in ALL_METRICS])
-    out["imaging_oracle"] = metric_oracle_score(out, [f"{m}_delta" for m in QUALITY_METRICS])
-    out["temporal_oracle"] = metric_oracle_score(out, [f"{m}_delta" for m in TEMPORAL_METRICS])
-    return out
+    if "global_mean_oracle" not in group:
+        group["global_mean_oracle"] = metric_oracle_score(group, [f"{m}_delta" for m in ALL_METRICS])
+    if "imaging_oracle" not in group:
+        group["imaging_oracle"] = metric_oracle_score(group, [f"{m}_delta" for m in QUALITY_METRICS])
+    if "temporal_oracle" not in group:
+        group["temporal_oracle"] = metric_oracle_score(group, [f"{m}_delta" for m in TEMPORAL_METRICS])
+    return group
 
 
 def schedule_from_indices(total_chunks: int, fast_steps: int, heavy_steps: int, indices: Sequence[int]) -> List[int]:
@@ -138,6 +127,7 @@ def build_ablation_schedules(
     seed: int,
     k: int,
     random_replicates: int,
+    router_columns: Sequence[str],
 ) -> Dict[str, List[int]]:
     schedules: Dict[str, List[int]] = {
         "all_fast": all_fast(total_chunks, fast_steps),
@@ -151,15 +141,22 @@ def build_ablation_schedules(
 
     amax_indices = top_indices(group, "A_max", k)
     schedules[f"Amax_k{k:02d}_h24"] = schedule_from_indices(total_chunks, fast_steps, 24, amax_indices)
-    schedules[f"S_instability_k{k:02d}_h24"] = schedule_from_indices(
-        total_chunks, fast_steps, 24, top_indices(group, "S_instability", k)
-    )
-    schedules[f"AplusS_k{k:02d}_h24"] = schedule_from_indices(
-        total_chunks, fast_steps, 24, top_indices(group, "AplusS", k)
-    )
-    schedules[f"AmulS_k{k:02d}_h24"] = schedule_from_indices(
-        total_chunks, fast_steps, 24, top_indices(group, "AmulS", k)
-    )
+    router_name = {
+        "A_max": f"Amax_k{k:02d}_h24",
+        "S_instability": f"S_top_k{k:02d}_h24",
+        "AplusS": f"AplusS_top_k{k:02d}_h24",
+        "AtimesS": f"AtimesS_top_k{k:02d}_h24",
+    }
+    for column in router_columns:
+        if column == "A_max":
+            continue
+        if column not in group:
+            raise RuntimeError(f"Requested router column not found: {column}")
+        if column not in router_name:
+            raise RuntimeError(f"No policy-name mapping for router column: {column}")
+        schedules[router_name[column]] = schedule_from_indices(
+            total_chunks, fast_steps, 24, top_indices(group, column, k)
+        )
     for heavy_steps in (12, 16, 20):
         schedules[f"Amax_k{k:02d}_h{heavy_steps:02d}"] = schedule_from_indices(
             total_chunks, fast_steps, heavy_steps, amax_indices
@@ -225,7 +222,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task_id", type=int, required=True, help="0..71, prompt_index * 3 + seed_index")
     parser.add_argument("--scores", type=Path, default=DEFAULT_SCORES)
-    parser.add_argument("--instability", type=Path, default=DEFAULT_INSTABILITY)
     parser.add_argument("--output_root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--prompt_set", type=Path, default=DEFAULT_PROMPTS)
     parser.add_argument("--num_prompts", type=int, default=24)
@@ -234,6 +230,7 @@ def main() -> None:
     parser.add_argument("--fast_steps", type=int, default=8)
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--random_replicates", type=int, default=20)
+    parser.add_argument("--router_columns", type=str, default="A_max,S_instability,AplusS,AtimesS")
     parser.add_argument("--num_output_frames", type=int, default=120)
     parser.add_argument("--fps", type=int, default=16)
     parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -268,7 +265,8 @@ def main() -> None:
     if total_chunks != 40:
         raise ValueError(f"Expected 40 chunks for AR-long ablation, got {total_chunks}")
 
-    score_group = load_score_group(args.scores, args.instability, prompt_id=prompt_id, seed=seed)
+    router_columns = [item.strip() for item in args.router_columns.split(",") if item.strip()]
+    score_group = load_score_group(args.scores, prompt_id=prompt_id, seed=seed)
     schedules = build_ablation_schedules(
         score_group,
         total_chunks=total_chunks,
@@ -277,6 +275,7 @@ def main() -> None:
         seed=seed,
         k=args.k,
         random_replicates=args.random_replicates,
+        router_columns=router_columns,
     )
     assert_ablation_schedules(schedules, total_chunks, args.fast_steps, args.k)
     write_policy_manifest(args.output_root, experiment_name, prompt_id, seed, schedules, args.fast_steps)

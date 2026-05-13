@@ -35,8 +35,7 @@ mkdir -p logs/keyframe_budget
 
 python -m experiments.keyframe_budget.scripts.generate_ar_long_router_ablation \
   --task_id "${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID is required}" \
-  --scores "${SCORES:-outputs/ar_teacher_long_keyframe_budget/compression_transition/compression_vbench_table.parquet}" \
-  --instability "${INSTABILITY:-outputs/ar_teacher_long_router_ablation/solver_instability_scores.parquet}" \
+  --scores "${SCORES:-outputs/ar_teacher_long_router_ablation/compression_vbench_with_solver_instability.parquet}" \
   --output_root "${OUTPUT_ROOT:-outputs/ar_teacher_long_router_ablation}" \
   --prompt_set "${PROMPT_SET:-experiments/keyframe_budget/prompts/motion_rich_24.json}" \
   --num_prompts "${NUM_PROMPTS:-24}" \
@@ -45,6 +44,7 @@ python -m experiments.keyframe_budget.scripts.generate_ar_long_router_ablation \
   --fast_steps "${FAST_STEPS:-8}" \
   --k "${K:-5}" \
   --random_replicates "${RANDOM_REPLICATES:-20}" \
+  --router_columns "${ROUTER_COLUMNS:-A_max,S_instability,AplusS,AtimesS}" \
   --num_output_frames "${NUM_OUTPUT_FRAMES:-120}" \
   --fps "${FPS:-16}" \
   --dtype "${DTYPE:-bfloat16}" \
