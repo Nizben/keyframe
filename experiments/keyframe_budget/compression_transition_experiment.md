@@ -1507,3 +1507,88 @@ Results space:
 ```text
 Pending corrected v2 generation and VBench.
 ```
+
+## Targeted Amax Ablation Lane
+
+Motivation:
+
+```text
+The corrected router evidence suggests Amax helps, but only weakly.
+The next question is why it helps:
+  - transition irregularity alone,
+  - fast-solver instability,
+  - medium-heavy denoising being better than 24-step heavy,
+  - or Amax implicitly targeting quality rather than temporal consistency.
+```
+
+New output root:
+
+```text
+outputs/ar_teacher_long_router_ablation
+```
+
+New S-instability score:
+
+```text
+S_i = mean_k ||x_i^{k+1} - x_i^k||_2 / (||x_i^k||_2 + eps)
+```
+
+Implementation detail:
+
+```text
+S is computed from an 8-step all-fast replay.
+Only scalar per-step relative movements are logged.
+Full denoising trajectories are not saved.
+```
+
+Ablation policies:
+
+```text
+all_fast
+all_heavy
+random_k05_h24_r00 ... random_k05_h24_r19
+Amax_k05_h24
+S_instability_k05_h24
+AplusS_k05_h24
+AmulS_k05_h24
+Amax_k05_h12
+Amax_k05_h16
+Amax_k05_h20
+global_mean_oracle_k05_h24
+imaging_oracle_k05_h24
+temporal_oracle_k05_h24
+```
+
+Total cohorts:
+
+```text
+32 cohorts
+7 VBench metrics
+224 VBench array tasks
+```
+
+Primary comparisons:
+
+```text
+AplusS_k05_h24 vs random mean
+AplusS_k05_h24 vs Amax_k05_h24
+S_instability_k05_h24 vs Amax_k05_h24
+Amax step-size curve: h12, h16, h20, h24
+Amax_k05_h24 vs global/imaging/temporal single-heavy oracles
+```
+
+Win condition:
+
+```text
+AplusS_k05_h24 improves vbench_mean_delta over random
+and improves delta_temp_raw more clearly than Amax_k05_h24.
+```
+
+Visual audit:
+
+```text
+The analysis writes visual_audit_candidates.csv with prompt-seeds where:
+  Amax >> random
+  Amax << random
+  Amax >> temporal oracle
+```

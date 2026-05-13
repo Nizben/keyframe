@@ -62,6 +62,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         return_video=True,
         steps_per_chunk: Optional[List[int]] = None,
         return_chunk_logs: bool = False,
+        record_solver_instability: bool = False,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -78,6 +79,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             steps_per_chunk (List[int], optional): Optional per-chunk denoising step budget.
                 If None, the global default sampling steps are used for all chunks.
             return_chunk_logs (bool): Whether to return per-chunk step and timing logs.
+            record_solver_instability (bool): Whether to add scalar latent-movement
+                diagnostics to chunk_logs. This does not save trajectories.
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
                 (batch_size, num_frames, num_channels, height, width). It is normalized to be in the range [0, 1].
@@ -243,6 +246,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 noise, sampling_steps=requested_steps
             )
             actual_steps = len(sample_scheduler.timesteps)
+            solver_step_rel_changes: List[float] = []
             warning = ""
             if actual_steps != requested_steps:
                 warning = (
@@ -286,6 +290,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     t,
                     latents,
                     return_dict=False)[0]
+                if record_solver_instability:
+                    diff_norm = (temp_x0.float() - latents.float()).pow(2).sum().sqrt()
+                    base_norm = latents.float().pow(2).sum().sqrt()
+                    rel_change = diff_norm / (base_norm + 1e-8)
+                    solver_step_rel_changes.append(float(rel_change.detach().cpu().item()))
                 latents = temp_x0
                 if self.debug_cache_logs:
                     print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
@@ -317,14 +326,21 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
             cache_start_frame += current_num_frames
-            chunk_logs.append({
+            chunk_log = {
                 "chunk_idx": chunk_idx,
                 "num_frames": current_num_frames,
                 "requested_num_steps": requested_steps,
                 "actual_num_steps": actual_steps,
                 "runtime_sec": time.perf_counter() - chunk_start_time,
                 "warning": warning,
-            })
+            }
+            if record_solver_instability:
+                chunk_log["solver_step_rel_changes"] = solver_step_rel_changes
+                chunk_log["solver_instability"] = (
+                    sum(solver_step_rel_changes) / len(solver_step_rel_changes)
+                    if solver_step_rel_changes else 0.0
+                )
+            chunk_logs.append(chunk_log)
 
         # Step 4: Decode the output
         if return_video:
