@@ -1541,6 +1541,19 @@ Only scalar per-step relative movements are logged.
 Full denoising trajectories are not saved.
 ```
 
+Important entrypoint distinction:
+
+```text
+runner.py normal rollouts intentionally do not emit S.
+generate_ar_long_router_policy.py intentionally remains the corrected v2 router entrypoint.
+
+The S ablation entrypoints are:
+  extract_ar_long_solver_instability.py / compute_ar_long_solver_instability.py
+  merge_ar_long_solver_instability.py
+  merge_solver_instability_with_compression.py
+  generate_ar_long_router_ablation.py
+```
+
 Ablation policies:
 
 ```text
@@ -1591,4 +1604,28 @@ The analysis writes visual_audit_candidates.csv with prompt-seeds where:
   Amax >> random
   Amax << random
   Amax >> temporal oracle
+```
+
+Launch readiness checks:
+
+```bash
+python experiments/keyframe_budget/scripts/check_ar_long_router_ablation_ready.py
+```
+
+Expected state before generation:
+
+```text
+72 S-preview shards
+2880 merged S rows
+2880 merged compression+S rows
+columns: A_max, S_instability, AplusS, AtimesS
+```
+
+Expected state after ablation generation:
+
+```text
+72 router_ablation_manifest.json files
+32 cohorts per manifest
+all non-baseline policies select exactly 5 chunks
+VBench slurm: 7 metrics x 32 cohorts = array 0-223
 ```

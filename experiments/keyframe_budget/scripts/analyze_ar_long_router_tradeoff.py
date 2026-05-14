@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze AR-long Amax/S router ablation VBench results."""
+"""Analyze AR-long router tradeoff confirmation VBench results."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def write_csv(path: Path, df: pd.DataFrame) -> None:
 
 def read_manifests(root: Path) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    for path in sorted(root.glob("ar_teacher_long_router_ablation_p*_s*/router_ablation_manifest.json")):
+    for path in sorted(root.glob("ar_teacher_long_router_tradeoff_p*_s*/router_tradeoff_manifest.json")):
         payload = json.loads(path.read_text(encoding="utf-8"))
         for row in payload.get("policies", []):
             rows.append(
@@ -49,7 +49,7 @@ def read_manifests(root: Path) -> pd.DataFrame:
                 }
             )
     if not rows:
-        raise RuntimeError(f"No ablation manifests found under {root}")
+        raise RuntimeError(f"No tradeoff manifests found under {root}")
     return pd.DataFrame(rows).drop(columns=["selected_chunks", "steps_per_chunk"], errors="ignore")
 
 
@@ -78,32 +78,28 @@ def metric_pivot(records: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_policy(policy_name: str) -> Tuple[str, int]:
-    if policy_name in {"all_fast", "all_heavy"}:
-        return policy_name, 24 if policy_name == "all_heavy" else 8
-    if policy_name.startswith("random"):
-        return "random", 24
+    if policy_name == "all_fast":
+        return "all_fast", 8
+    if policy_name == "all_heavy_h24":
+        return "all_heavy", 24
+    if policy_name.startswith("random_k05_h"):
+        return "random", int(policy_name.split("_h", 1)[1].split("_", 1)[0])
     if policy_name.startswith("Amax_k05_h"):
         return "Amax", int(policy_name.rsplit("_h", 1)[1])
-    if policy_name.startswith("S_top"):
-        return "S", 24
-    if policy_name.startswith("AplusS_top"):
-        return "AplusS", 24
-    if policy_name.startswith("AtimesS_top"):
-        return "AtimesS", 24
-    if policy_name.startswith("global_mean_oracle"):
-        return "global_mean_oracle", 24
-    if policy_name.startswith("imaging_oracle"):
-        return "imaging_oracle", 24
-    if policy_name.startswith("temporal_oracle"):
-        return "temporal_oracle", 24
+    if policy_name.startswith("AplusS_k05_h"):
+        return "AplusS", int(policy_name.rsplit("_h", 1)[1])
+    if policy_name.startswith("temporal_oracle_k05_h"):
+        return "temporal_oracle", int(policy_name.rsplit("_h", 1)[1])
+    if policy_name.startswith("imaging_oracle_k05_h"):
+        return "imaging_oracle", int(policy_name.rsplit("_h", 1)[1])
     return policy_name, -1
 
 
 def add_deltas(scores: pd.DataFrame) -> pd.DataFrame:
     fast = scores[scores["policy_name"] == "all_fast"].drop(columns=["policy_name"])
-    heavy = scores[scores["policy_name"] == "all_heavy"].drop(columns=["policy_name"])
+    heavy = scores[scores["policy_name"] == "all_heavy_h24"].drop(columns=["policy_name"])
     if fast.empty or heavy.empty:
-        raise RuntimeError("Ablation analysis requires same-batch all_fast and all_heavy.")
+        raise RuntimeError("Tradeoff analysis requires same-batch all_fast and all_heavy_h24.")
     merged = scores.merge(fast, on=["prompt_id", "seed"], suffixes=("", "_all_fast"))
     merged = merged.merge(heavy, on=["prompt_id", "seed"], suffixes=("", "_all_heavy"))
     for metric in ALL_METRICS:
@@ -148,72 +144,67 @@ def paired_against(table: pd.DataFrame, target_policy: str, comp: pd.DataFrame, 
     return pd.DataFrame(rows)
 
 
+def random_mean_for_step(table: pd.DataFrame, heavy_steps: int) -> pd.DataFrame:
+    return table[(table["policy_family"] == "random") & (table["heavy_steps"] == heavy_steps)].groupby(
+        ["prompt_id", "seed"], as_index=False
+    ).mean(numeric_only=True)
+
+
 def build_pairwise(table: pd.DataFrame) -> pd.DataFrame:
-    random_mean = table[table["policy_family"] == "random"].groupby(["prompt_id", "seed"], as_index=False).mean(
-        numeric_only=True
-    )
     comparisons = []
-    for policy in ("Amax_k05_h24", "S_top_k05_h24", "AplusS_top_k05_h24", "AtimesS_top_k05_h24"):
-        comparisons.append(paired_against(table, policy, random_mean, "random_mean"))
-        if policy != "Amax_k05_h24":
-            comparisons.append(paired_against(table, policy, table[table["policy_name"] == "Amax_k05_h24"], "Amax_k05_h24"))
-    for policy in ("Amax_k05_h12", "Amax_k05_h16", "Amax_k05_h20", "Amax_k05_h24"):
-        comparisons.append(paired_against(table, policy, random_mean, "random_mean"))
-    for policy in ("global_mean_oracle_k05_h24", "imaging_oracle_k05_h24", "temporal_oracle_k05_h24"):
-        comparisons.append(paired_against(table, "Amax_k05_h24", table[table["policy_name"] == policy], policy))
+    matched_random_targets = [
+        ("Amax_k05_h12", 12),
+        ("Amax_k05_h16", 16),
+        ("AplusS_k05_h12", 12),
+        ("AplusS_k05_h16", 16),
+        ("AplusS_k05_h24", 24),
+        ("temporal_oracle_k05_h16", 16),
+        ("imaging_oracle_k05_h12", 12),
+    ]
+    for target, heavy_steps in matched_random_targets:
+        comparisons.append(paired_against(table, target, random_mean_for_step(table, heavy_steps), f"random_h{heavy_steps:02d}_mean"))
+
+    direct = [
+        ("AplusS_k05_h12", "Amax_k05_h12"),
+        ("AplusS_k05_h16", "Amax_k05_h16"),
+        ("AplusS_k05_h24", "Amax_k05_h16"),
+        ("AplusS_k05_h24", "Amax_k05_h12"),
+        ("temporal_oracle_k05_h16", "AplusS_k05_h16"),
+        ("imaging_oracle_k05_h12", "Amax_k05_h12"),
+    ]
+    for target, comp_name in direct:
+        comparisons.append(paired_against(table, target, table[table["policy_name"] == comp_name], comp_name))
+
     return pd.concat(comparisons, ignore_index=True).drop_duplicates(
         ["target_policy", "comparison", "metric"],
         keep="first",
     )
 
 
-def visual_candidates(table: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
-    random_mean = table[table["policy_family"] == "random"].groupby(["prompt_id", "seed"], as_index=False).mean(
-        numeric_only=True
-    )
-    base = table[table["policy_name"] == "Amax_k05_h24"][
-        ["prompt_id", "seed", "delta_temp_raw", "vbench_mean_delta"]
-    ].merge(random_mean[["prompt_id", "seed", "delta_temp_raw", "vbench_mean_delta"]], on=["prompt_id", "seed"], suffixes=("_Amax", "_random"))
-    temporal_oracle = table[table["policy_name"] == "temporal_oracle_k05_h24"][
-        ["prompt_id", "seed", "delta_temp_raw", "vbench_mean_delta"]
-    ]
-    base = base.merge(temporal_oracle, on=["prompt_id", "seed"], suffixes=("", "_temporal_oracle"))
-    base["Amax_minus_random_temp"] = base["delta_temp_raw_Amax"] - base["delta_temp_raw_random"]
-    base["Amax_minus_random_mean"] = base["vbench_mean_delta_Amax"] - base["vbench_mean_delta_random"]
-    base["Amax_minus_oracle_temp"] = base["delta_temp_raw_Amax"] - base["delta_temp_raw"]
-
-    groups = [
-        ("Amax_gt_random", base.nlargest(4, "Amax_minus_random_temp")),
-        ("Amax_lt_random", base.nsmallest(3, "Amax_minus_random_temp")),
-        ("Amax_gt_oracle", base.nlargest(3, "Amax_minus_oracle_temp")),
-    ]
-    rows = []
-    for label, subset in groups:
-        for _, row in subset.iterrows():
-            rows.append({"audit_group": label, **row.to_dict()})
-    candidates = pd.DataFrame(rows).drop_duplicates(["audit_group", "prompt_id", "seed"])
-    write_csv(out_dir / "visual_audit_candidates.csv", candidates)
-    return candidates
-
-
-def plot_summaries(summary: pd.DataFrame, out_dir: Path) -> None:
+def plot_summaries(summary: pd.DataFrame, pairwise: pd.DataFrame, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    sub = summary[summary["policy_family"].isin(["random", "Amax", "AplusS", "temporal_oracle", "imaging_oracle", "all_fast", "all_heavy"])].copy()
+    sub["label"] = sub["policy_family"] + "_h" + sub["heavy_steps"].astype(str)
+    sub.loc[sub["policy_family"].isin(["all_fast", "all_heavy"]), "label"] = sub["policy_family"]
+    order = [
+        "all_fast",
+        "random_h12",
+        "Amax_h12",
+        "AplusS_h12",
+        "imaging_oracle_h12",
+        "random_h16",
+        "Amax_h16",
+        "AplusS_h16",
+        "temporal_oracle_h16",
+        "random_h24",
+        "AplusS_h24",
+        "all_heavy",
+    ]
+    sub["order"] = sub["label"].map({name: i for i, name in enumerate(order)})
+    sub = sub.dropna(subset=["order"]).sort_values("order")
     for metric in ("delta_temp_raw", "vbench_mean_delta"):
-        policy_order = [
-            "random",
-            "Amax",
-            "S",
-            "AplusS",
-            "AtimesS",
-            "global_mean_oracle",
-            "imaging_oracle",
-            "temporal_oracle",
-        ]
-        sub = summary[(summary["heavy_steps"] == 24) & (summary["policy_family"].isin(policy_order))].copy()
-        sub["order"] = sub["policy_family"].map({name: i for i, name in enumerate(policy_order)})
-        sub = sub.sort_values("order")
-        plt.figure(figsize=(10, 4))
-        plt.bar(sub["policy_family"], sub[metric])
+        plt.figure(figsize=(12, 4))
+        plt.bar(sub["label"], sub[metric])
         plt.axhline(0, color="black", linestyle="--", linewidth=1)
         plt.xticks(rotation=35, ha="right")
         plt.ylabel(metric)
@@ -221,15 +212,29 @@ def plot_summaries(summary: pd.DataFrame, out_dir: Path) -> None:
         plt.savefig(out_dir / f"policy_{metric}.png", dpi=180)
         plt.close()
 
-    step = summary[(summary["policy_family"] == "Amax") & (summary["heavy_steps"].isin([12, 16, 20, 24]))].sort_values("heavy_steps")
-    plt.figure(figsize=(6, 4))
-    plt.plot(step["heavy_steps"], step["delta_temp_raw"], marker="o", label="delta_temp_raw")
-    plt.plot(step["heavy_steps"], step["vbench_mean_delta"], marker="o", label="vbench_mean_delta")
+    plt.figure(figsize=(6, 5))
+    for _, row in sub.iterrows():
+        plt.scatter(row["vbench_mean_delta"], row["delta_temp_raw"])
+        plt.text(row["vbench_mean_delta"], row["delta_temp_raw"], row["label"], fontsize=8)
     plt.axhline(0, color="black", linestyle="--", linewidth=1)
-    plt.xlabel("Amax heavy steps")
-    plt.legend()
+    plt.axvline(0, color="black", linestyle="--", linewidth=1)
+    plt.xlabel("vbench_mean_delta")
+    plt.ylabel("delta_temp_raw")
     plt.tight_layout()
-    plt.savefig(out_dir / "Amax_step_size_ablation.png", dpi=180)
+    plt.savefig(out_dir / "temporal_vs_global_tradeoff.png", dpi=180)
+    plt.close()
+
+    wins = pairwise[
+        (pairwise["comparison"].str.startswith("random_h")) & (pairwise["metric"].isin(["delta_temp_raw", "vbench_mean_delta"]))
+    ].copy()
+    wins["label"] = wins["target_policy"] + " / " + wins["metric"]
+    plt.figure(figsize=(12, 4))
+    plt.bar(wins["label"], wins["win_rate"])
+    plt.axhline(0.5, color="black", linestyle="--", linewidth=1)
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("paired win rate vs matched random")
+    plt.tight_layout()
+    plt.savefig(out_dir / "matched_random_winrates.png", dpi=180)
     plt.close()
 
 
@@ -238,10 +243,10 @@ def main() -> None:
     parser.add_argument(
         "--vbench",
         type=Path,
-        default=Path("outputs/ar_teacher_long_router_ablation/vbench_analysis/vbench_video_records.csv"),
+        default=Path("outputs/ar_teacher_long_router_tradeoff/vbench_analysis/vbench_video_records.csv"),
     )
-    parser.add_argument("--root", type=Path, default=Path("outputs/ar_teacher_long_router_ablation"))
-    parser.add_argument("--out_dir", type=Path, default=Path("outputs/ar_teacher_long_router_ablation/analysis"))
+    parser.add_argument("--root", type=Path, default=Path("outputs/ar_teacher_long_router_tradeoff"))
+    parser.add_argument("--out_dir", type=Path, default=Path("outputs/ar_teacher_long_router_tradeoff/analysis"))
     args = parser.parse_args()
 
     records = load_video_records(args.vbench)
@@ -264,19 +269,18 @@ def main() -> None:
             delta_qual_raw=("delta_qual_raw", "mean"),
             vbench_mean_delta=("vbench_mean_delta", "mean"),
             vbench_mean=("vbench_mean", "mean"),
+            total_nfe_requested=("total_nfe_requested", "mean"),
         )
         .sort_values(["heavy_steps", "policy_family"])
     )
     pairwise = build_pairwise(table)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    write_csv(args.out_dir / "ablation_by_sample.csv", table)
-    write_csv(args.out_dir / "ablation_summary.csv", summary)
-    write_csv(args.out_dir / "ablation_pairwise.csv", pairwise)
-    write_csv(args.out_dir / "ablation_chosen_chunks.csv", manifests)
-    visual_candidates(table, args.out_dir)
-    plot_summaries(summary, args.out_dir / "plots")
-    print(f"[router-ablation-analysis] rows={len(table)} wrote={args.out_dir}")
+    write_csv(args.out_dir / "tradeoff_by_sample.csv", table)
+    write_csv(args.out_dir / "tradeoff_summary.csv", summary)
+    write_csv(args.out_dir / "tradeoff_pairwise.csv", pairwise)
+    plot_summaries(summary, pairwise, args.out_dir / "plots")
+    print(f"[router-tradeoff-analysis] rows={len(table)} wrote={args.out_dir}")
 
 
 if __name__ == "__main__":
